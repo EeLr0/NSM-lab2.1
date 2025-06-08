@@ -3,11 +3,11 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives import hashes
 import os
 
-def encryptMessage(key, plainText, associated_data=b""):
+def encrypt_message(key, plaintext, associated_data=b""):
     nonce = os.urandom(12)
     aesgcm = AESGCM(key)
-    cipherText = aesgcm.encrypt(nonce, plainText.encode(), associated_data)
-    return nonce, cipherText
+    ciphertext = aesgcm.encrypt(nonce, plaintext, associated_data)
+    return nonce, ciphertext
 
 def decrypt_message(key, nonce, ciphertext, associated_data=b""):
     aesgcm = AESGCM(key)
