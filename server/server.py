@@ -4,6 +4,7 @@ from util.keyexchange import generate_dh_parameters, serialize_dh_parameters
 
 users_db = {}  # username: {"password": hash, "conn": socket, "dh_pub": bytes, "rsa_pub": bytes}
 lock = threading.Lock()
+shutdown_event = threading.Event()
 
 # Carrega certificado
 context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -12,7 +13,7 @@ cert_path = os.path.join(base_dir, 'cert.pem')
 key_path = os.path.join(base_dir, 'key.pem')
 context.load_cert_chain(certfile=cert_path, keyfile=key_path)
 
-# Gerar parametros DH fixos para todos os clientes
+# Gerar parâmetros DH fixos
 DH_PARAMS = generate_dh_parameters()
 DH_PARAMS_SERIALIZED = serialize_dh_parameters(DH_PARAMS)
 print("Parâmetros DH globais gerados e serializados")
@@ -21,8 +22,11 @@ def client_thread(connstream):
     username = None
     try:
         mode = connstream.recv(1024).decode()
+        print(f"[DEBUG] Modo recebido: '{mode}'")
         username = connstream.recv(1024).decode()
+        print(f"[DEBUG] Usuário recebido: '{username}'")
         password = connstream.recv(1024).decode()
+        print(f"[DEBUG] Senha recebida: {len(password)} caracteres")
 
         with lock:
             if mode == 'register':
@@ -41,20 +45,24 @@ def client_thread(connstream):
                 print(f"Usuário {username} logado")
             else:
                 connstream.send(b"INVALID_MODE")
+                print(f"Modo inválido: '{mode}'")
                 return
 
-        # Envia parâmetros DH serializados para o cliente
+        # Envia parâmetros DH
         param_size = len(DH_PARAMS_SERIALIZED)
         connstream.send(param_size.to_bytes(4, byteorder='big'))
         connstream.send(DH_PARAMS_SERIALIZED)
         print(f"Parâmetros DH enviados para {username} ({param_size} bytes)")
 
-        # Recebe chave DH do cliente
+        # Recebe chave DH
         key_size_bytes = connstream.recv(4)
-        if len(key_size_bytes) < 4:
-            print(f"Erro: não recebeu tamanho da chave DH do cliente {username}")
+        if len(key_size_bytes) != 4:
+            print(f"Erro: tamanho inválido para chave DH de {username} ({len(key_size_bytes)} bytes)")
             return
         key_size = int.from_bytes(key_size_bytes, byteorder='big')
+        if key_size > 1000000 or key_size <= 0:
+            print(f"Erro: tamanho de chave DH inválido: {key_size} bytes")
+            return
         print(f"Aguardando {key_size} bytes da chave DH de {username}...")
         client_dh_pub = b""
         while len(client_dh_pub) < key_size:
@@ -64,12 +72,15 @@ def client_thread(connstream):
             client_dh_pub += chunk
         print(f"Chave DH de {username} recebida ({len(client_dh_pub)} bytes)")
 
-        # Recebe chave RSA do cliente
+        # Recebe chave RSA
         rsa_size_bytes = connstream.recv(4)
-        if len(rsa_size_bytes) < 4:
-            print(f"Erro: não recebeu tamanho da chave RSA do cliente {username}")
+        if len(rsa_size_bytes) != 4:
+            print(f"Erro: tamanho inválido para chave RSA de {username} ({len(rsa_size_bytes)} bytes)")
             return
         rsa_size = int.from_bytes(rsa_size_bytes, byteorder='big')
+        if rsa_size > 1000000 or rsa_size <= 0:
+            print(f"Erro: tamanho de chave RSA inválido: {rsa_size} bytes")
+            return
         rsa_pub_bytes = b""
         while len(rsa_pub_bytes) < rsa_size:
             chunk = connstream.recv(rsa_size - len(rsa_pub_bytes))
@@ -87,9 +98,9 @@ def client_thread(connstream):
         peer_name = connstream.recv(1024).decode()
         print(f"{username} quer conversar com {peer_name}")
 
-        # Espera o peer ficar pronto
+        # Espera o peer
         peer_dh_pub = None
-        max_attempts = 30
+        max_attempts = 60  # Aumentado para 60s
         for _ in range(max_attempts):
             with lock:
                 if peer_name in users_db and "dh_pub" in users_db[peer_name]:
@@ -98,30 +109,34 @@ def client_thread(connstream):
             if _ == 0:
                 connstream.send(b"WAITING_FOR_PEER")
             time.sleep(1)
+            if shutdown_event.is_set():
+                return
 
         if peer_dh_pub is None:
             connstream.send(b"PEER_NOT_AVAILABLE")
-            print(f"Peer {peer_name} não ficou disponível em 30 segundos")
+            print(f"Peer {peer_name} não ficou disponível em 60 segundos")
             return
 
         # Envia chave DH do peer
-        connstream.send(len(peer_dh_pub).to_bytes(4, 'big'))
+        peer_dh_size = len(peer_dh_pub)
+        connstream.send(peer_dh_size.to_bytes(4, 'big'))
         connstream.send(peer_dh_pub)
-        print(f"Chave DH de {peer_name} enviada para {username} ({len(peer_dh_pub)} bytes)")
+        print(f"Chave DH de {peer_name} enviada para {username} ({peer_dh_size} bytes)")
 
         # Envia chave RSA do peer
         with lock:
             peer_rsa_pub = users_db[peer_name].get("rsa_pub", None)
         if peer_rsa_pub:
-            connstream.send(len(peer_rsa_pub).to_bytes(4, 'big'))
+            peer_rsa_size = len(peer_rsa_pub)
+            connstream.send(peer_rsa_size.to_bytes(4, 'big'))
             connstream.send(peer_rsa_pub)
-            print(f"Chave RSA de {peer_name} enviada para {username} ({len(peer_rsa_pub)} bytes)")
+            print(f"Chave RSA de {peer_name} enviada para {username} ({peer_rsa_size} bytes)")
         else:
             connstream.send((0).to_bytes(4, 'big'))
             print(f"Peer {peer_name} não tem chave RSA registrada")
 
-        # Loop de retransmissão de mensagens
-        while True:
+        # Loop de mensagens
+        while not shutdown_event.is_set():
             try:
                 data = connstream.recv(16384)
                 if not data:
@@ -154,16 +169,24 @@ def client_thread(connstream):
 def main():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0) as sock:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((SERVER_HOST, SERVER_PORT))
-        sock.listen(5)
-        print(f"Servidor TLS ativo em {SERVER_HOST}:{SERVER_PORT}")
-        while True:
-            try:
-                conn, addr = sock.accept()
-                connstream = context.wrap_socket(conn, server_side=True)
-                threading.Thread(target=client_thread, args=(connstream,), daemon=True).start()
-            except Exception as e:
-                print(f"Erro ao aceitar conexão: {e}")
+        try:
+            sock.bind((SERVER_HOST, SERVER_PORT))
+            sock.listen(5)
+            print(f"Servidor TLS ativo em {SERVER_HOST}:{SERVER_PORT}")
+            while not shutdown_event.is_set():
+                sock.settimeout(1.0)
+                try:
+                    conn, addr = sock.accept()
+                    connstream = context.wrap_socket(conn, server_side=True)
+                    threading.Thread(target=client_thread, args=(connstream,), daemon=True).start()
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    print(f"Erro ao aceitar conexão: {e}")
+        except Exception as e:
+            print(f"Erro ao iniciar servidor: {e}")
+        finally:
+            sock.close()
 
 if __name__ == "__main__":
     main()
